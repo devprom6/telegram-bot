@@ -188,6 +188,57 @@ export interface StellarConfig {
 export interface TelegramRoute {
   chatId: string;
   channelPreviewMode: boolean;
+  /** Previous group chat id recorded when Telegram migrated the chat to a supergroup. */
+  migratedFromChatId?: string;
+}
+
+/**
+ * Update configured chat routes in-place after Telegram reports a group-to-supergroup
+ * migration (`migrate_to_chat_id`). Returns `true` if any route changed.
+ */
+export function applyChatMigration(
+  config: Partial<
+    Pick<BotConfig, "chatId" | "chatIds" | "marketChatId" | "squadChatId" | "routes">
+  >,
+  fromChatId: string,
+  toChatId: string,
+): boolean {
+  const from = fromChatId.trim();
+  const to = toChatId.trim();
+  if (!from || !to || from === to) return false;
+
+  let changed = false;
+  if (config.chatId === from) {
+    config.chatId = to;
+    changed = true;
+  }
+  if (config.marketChatId === from) {
+    config.marketChatId = to;
+    changed = true;
+  }
+  if (config.squadChatId === from) {
+    config.squadChatId = to;
+    changed = true;
+  }
+  if (Array.isArray(config.chatIds)) {
+    const next: string[] = [];
+    for (const id of config.chatIds) {
+      const mapped = id === from ? to : id;
+      if (id === from) changed = true;
+      if (!next.includes(mapped)) next.push(mapped);
+    }
+    if (changed) config.chatIds = next;
+  }
+  if (Array.isArray(config.routes)) {
+    for (const route of config.routes) {
+      if (route.chatId === from) {
+        route.chatId = to;
+        route.migratedFromChatId = from;
+        changed = true;
+      }
+    }
+  }
+  return changed;
 }
 
 export interface BotConfig extends StellarConfig {

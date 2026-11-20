@@ -13,7 +13,7 @@
 
 import type { Bot } from "grammy";
 
-import type { BotConfig } from "../config.js";
+import { applyChatMigration, type BotConfig } from "../config.js";
 import type { ContractSource } from "../stellar/decode.js";
 import {
   safeErrorMessage,
@@ -74,6 +74,36 @@ export function isMarkdownParseError(err: unknown): boolean {
   return true;
 }
 
+/**
+ * Extract `parameters.migrate_to_chat_id` from a Telegram Bot API 400 error
+ * when a group chat has been upgraded to a supergroup. Returns `null` for any
+ * other error or invalid migration target.
+ */
+export function extractMigrateToChatId(err: unknown): string | null {
+  if (!err || typeof err !== "object") return null;
+  const record = err as {
+    error_code?: unknown;
+    parameters?: { migrate_to_chat_id?: unknown } | undefined;
+  };
+  if (typeof record.error_code === "number" && record.error_code !== 400) {
+    return null;
+  }
+  const raw = record.parameters?.migrate_to_chat_id;
+  if (typeof raw === "number") {
+    return Number.isSafeInteger(raw) && raw !== 0 ? String(raw) : null;
+  }
+  if (typeof raw === "string") {
+    const trimmed = raw.trim();
+    return /^-?\d+$/.test(trimmed) && trimmed !== "0" ? trimmed : null;
+  }
+  return null;
+}
+
+export interface NotifierOptions {
+  /** Optional callback invoked when a route is updated via `migrate_to_chat_id`. */
+  onRouteMigrated?: ((fromChatId: string, toChatId: string) => void) | undefined;
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 /** Bounded log fragment identifying which event a fallback send belongs to. */
@@ -116,12 +146,123 @@ export const notifierSkips = { emptyText: 0 };
  * 400, and a formatters' `null` must never turn into a doomed send. The skip
  * is counted in {@link notifierSkips} and logged with bounded metadata.
  */
+export type Notifier = ((
+  text: string | null,
+  source?: ContractSource,
+  extra?: SendExtra,
+) => Promise<void>) & {
+  migrateRoute: (fromChatId: string, toChatId: string) => boolean;
+  resolveChatId: (chatId: string) => string;
+};
+
 export function createNotifier(
   bot: Pick<Bot, "api">,
   config: Pick<BotConfig, "chatId" | "marketChatId" | "squadChatId" | "botToken"> &
-    Partial<Pick<BotConfig, "chatIds" | "linkPreviewMarket" | "linkPreviewSquad" | "silentEvents">>,
-) {
-  return async (
+    Partial<
+      Pick<
+        BotConfig,
+        "chatIds" | "linkPreviewMarket" | "linkPreviewSquad" | "silentEvents" | "routes"
+      >
+    >,
+  options?: NotifierOptions,
+): Notifier {
+  const migrations = new Map<string, string>();
+  const secrets = typeof config.botToken === "string" ? [config.botToken] : [];
+
+  function resolveChatId(chatId: string): string {
+    let current = chatId;
+    const seen = new Set<string>();
+    while (migrations.has(current) && !seen.has(current)) {
+      seen.add(current);
+      current = migrations.get(current)!;
+    }
+    return current;
+  }
+
+  function migrateRoute(fromChatId: string, toChatId: string): boolean {
+    const from = fromChatId.trim();
+    const to = toChatId.trim();
+    if (!from || !to || from === to) return false;
+    // Prevent cyclic migrations (e.g. to -> ... -> from).
+    if (resolveChatId(to) === from) return false;
+    if (migrations.get(from) === to) return false;
+
+    migrations.set(from, to);
+    applyChatMigration(config, from, to);
+    console.warn(`[notifier] route migrated to supergroup chat id`);
+    options?.onRouteMigrated?.(from, to);
+    return true;
+  }
+
+  async function sendToChat(
+    chatId: string,
+    text: string,
+    notificationOptions: {
+      parse_mode: "MarkdownV2";
+      link_preview_options: { is_disabled: boolean };
+      disable_notification?: boolean;
+    },
+    silentOption: { disable_notification?: boolean },
+    extra?: SendExtra,
+    omitReplyTo = false,
+  ): Promise<void> {
+    const replyToMessageId = omitReplyTo ? undefined : extra?.replyToMessageId;
+
+    // Oversized payloads go out as ordered chunks under Telegram's limit. The
+    // thread reply rides on the first chunk and the explorer button on the
+    // last, so the message reads exactly like the unsplit one.
+    const parts = splitTelegramMessage(text);
+    if (parts.length > 1) {
+      for (const [index, part] of parts.entries()) {
+        await bot.api.sendMessage(chatId, part, {
+          ...notificationOptions,
+          ...(index === parts.length - 1 && extra?.reply_markup
+            ? { reply_markup: extra.reply_markup }
+            : {}),
+          ...(index === 0 && replyToMessageId !== undefined
+            ? { reply_parameters: { chat_id: chatId, message_id: replyToMessageId } }
+            : {}),
+        });
+      }
+      return;
+    }
+
+    try {
+      await bot.api.sendMessage(chatId, text, {
+        ...notificationOptions,
+        ...(extra?.reply_markup ? { reply_markup: extra.reply_markup } : {}),
+        ...(replyToMessageId !== undefined
+          ? { reply_parameters: { chat_id: chatId, message_id: replyToMessageId } }
+          : {}),
+      });
+      return;
+    } catch (err) {
+      // A blank fallback is no fallback: sending whitespace-only text would
+      // just draw the same 400, so the original parse error propagates.
+      const fallback = extra?.plainText;
+      if (typeof fallback !== "string" || fallback.trim() === "" || !isMarkdownParseError(err)) {
+        throw err;
+      }
+      // Only bounded metadata is logged: the fallback outcome, the safe error
+      // category, and the caller-supplied event reference — never message
+      // text, tokens, or remote payloads.
+      console.warn(
+        `[notifier] MarkdownV2 rejected${eventRefLabel(extra?.eventRef)}, ` +
+          `retrying as plain text: ${safeErrorMessage(err, secrets)}`,
+      );
+      // Plain text (no parse mode), same per-source link preview setting.
+      await bot.api.sendMessage(chatId, fallback, {
+        link_preview_options: notificationOptions.link_preview_options,
+        ...silentOption,
+        ...(extra?.reply_markup ? { reply_markup: extra.reply_markup } : {}),
+        ...(replyToMessageId !== undefined
+          ? { reply_parameters: { chat_id: chatId, message_id: replyToMessageId } }
+          : {}),
+      });
+    }
+  }
+
+  const notify = async (
     text: string | null,
     source?: ContractSource,
     extra?: SendExtra,
@@ -139,11 +280,12 @@ export function createNotifier(
     }
 
     const defaultChat = config.chatId ?? config.chatIds?.[0] ?? "";
-    const chatId = source === "market"
+    const configuredChatId = source === "market"
       ? config.marketChatId || defaultChat
       : source === "squad"
         ? config.squadChatId || defaultChat
         : defaultChat;
+    const chatId = resolveChatId(configuredChatId);
 
     // Select link preview settings based on the contract source.
     // Commands (where source is undefined) always use TELEGRAM_OPTIONS (disabled).
@@ -162,60 +304,17 @@ export function createNotifier(
       ...silentOption,
     };
 
-    // Oversized payloads go out as ordered chunks under Telegram's limit. The
-    // thread reply rides on the first chunk and the explorer button on the
-    // last, so the message reads exactly like the unsplit one.
-    const parts = splitTelegramMessage(text);
-    if (parts.length > 1) {
-      for (const [index, part] of parts.entries()) {
-        await bot.api.sendMessage(chatId, part, {
-          ...notificationOptions,
-          ...(index === parts.length - 1 && extra?.reply_markup
-            ? { reply_markup: extra.reply_markup }
-            : {}),
-          ...(index === 0 && extra?.replyToMessageId !== undefined
-            ? { reply_parameters: { chat_id: chatId, message_id: extra.replyToMessageId } }
-            : {}),
-        });
-      }
-      return;
-    }
-
     try {
-      await bot.api.sendMessage(chatId, text, {
-        ...notificationOptions,
-        ...(extra?.reply_markup ? { reply_markup: extra.reply_markup } : {}),
-        ...(extra?.replyToMessageId !== undefined
-          ? { reply_parameters: { chat_id: chatId, message_id: extra.replyToMessageId } }
-          : {}),
-      });
-      return;
+      await sendToChat(chatId, text, notificationOptions, silentOption, extra);
     } catch (err) {
-      // A blank fallback is no fallback: sending whitespace-only text would
-      // just draw the same 400, so the original parse error propagates.
-      const fallback = extra?.plainText;
-      if (typeof fallback !== "string" || fallback.trim() === "" || !isMarkdownParseError(err)) {
-        throw err;
+      const migratedTo = extractMigrateToChatId(err);
+      if (migratedTo && migrateRoute(chatId, migratedTo)) {
+        await sendToChat(migratedTo, text, notificationOptions, silentOption, extra, true);
+        return;
       }
-      // Only bounded metadata is logged: the fallback outcome, the safe error
-      // category, and the caller-supplied event reference — never message
-      // text, tokens, or remote payloads.
-      console.warn(
-        `[notifier] MarkdownV2 rejected${eventRefLabel(extra?.eventRef)}, ` +
-          `retrying as plain text: ${safeErrorMessage(
-            err,
-            typeof config.botToken === "string" ? [config.botToken] : [],
-          )}`,
-      );
-      // Plain text (no parse mode), same per-source link preview setting.
-      await bot.api.sendMessage(chatId, fallback, {
-        link_preview_options: notificationOptions.link_preview_options,
-        ...silentOption,
-        ...(extra?.reply_markup ? { reply_markup: extra.reply_markup } : {}),
-        ...(extra?.replyToMessageId !== undefined
-          ? { reply_parameters: { chat_id: chatId, message_id: extra.replyToMessageId } }
-          : {}),
-      });
+      throw err;
     }
   };
+
+  return Object.assign(notify, { migrateRoute, resolveChatId });
 }
