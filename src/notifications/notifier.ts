@@ -9,11 +9,13 @@
  *   - {@link isMarkdownParseError} — classifier for Telegram entity-parse failures
  *   - {@link notifierSkips}    — counters for suppressed sends
  *   - {@link createNotifier}   — factory that returns the poller's send function
+ *   - {@link previewRouting}   — read-only routing preview (no Telegram calls)
+ *   - {@link routeStatus}      — actionable status when zero routes are active
  */
 
 import type { Bot } from "grammy";
 
-import { DEFAULT_ROUTE_COOLDOWN_MS, type BotConfig } from "../config.js";
+import { applyChatMigration, type BotConfig } from "../config.js";
 import type { ContractSource } from "../stellar/decode.js";
 import {
   safeErrorMessage,
@@ -75,96 +77,33 @@ export function isMarkdownParseError(err: unknown): boolean {
 }
 
 /**
- * True when a Telegram send failed due to missing chat/channel permissions
- * (e.g. 403 Forbidden, bot kicked/blocked/not a member, or 400 lacking send
- * rights). Rate limits (429), auth errors (401), entity-parse errors (400),
- * and transient network errors never qualify.
+ * Extract `parameters.migrate_to_chat_id` from a Telegram Bot API 400 error
+ * when a group chat has been upgraded to a supergroup. Returns `null` for any
+ * other error or invalid migration target.
  */
-export function isPermissionFailure(err: unknown): boolean {
-  if (!err || typeof err !== "object") return false;
-  const record = err as { error_code?: unknown; description?: unknown; message?: unknown };
-  if (typeof record.error_code === "number") {
-    if (record.error_code === 403) return true;
-    if (record.error_code !== 400) return false;
-  }
-  const text = [record.description, record.message]
-    .filter((part): part is string => typeof part === "string" && part !== "")
-    .join(" ");
-  return /not enough rights|have no rights to send|chat_write_forbidden|bot was kicked|bot was blocked|bot is not a member|need administrator rights/i.test(
-    text,
-  );
-}
-
-// ── Route Cooldowns ──────────────────────────────────────────────────────────
-
-export interface RouteCooldownState {
-  chatId: string;
-  until: number;
-  failures: number;
-  reason: string;
-}
-
-export interface RouteCooldownTracker {
-  isInCooldown(chatId: string): boolean;
-  getCooldown(chatId: string): RouteCooldownState | undefined;
-  recordPermissionFailure(chatId: string, reason: string): RouteCooldownState | undefined;
-  clearCooldown(chatId: string): boolean;
-  clearAllCooldowns(): void;
-}
-
-export function createRouteCooldownTracker(
-  cooldownMs: number,
-  now: () => number = Date.now,
-): RouteCooldownTracker {
-  const entries = new Map<string, RouteCooldownState>();
-  const duration = Number.isFinite(cooldownMs) && cooldownMs > 0 ? cooldownMs : 0;
-
-  function activeEntry(chatId: string): RouteCooldownState | undefined {
-    const entry = entries.get(chatId);
-    if (!entry) return undefined;
-    if (now() >= entry.until) {
-      entries.delete(chatId);
-      return undefined;
-    }
-    return entry;
-  }
-
-  return {
-    isInCooldown(chatId: string): boolean {
-      return activeEntry(chatId) !== undefined;
-    },
-    getCooldown(chatId: string): RouteCooldownState | undefined {
-      const entry = activeEntry(chatId);
-      return entry ? { ...entry } : undefined;
-    },
-    recordPermissionFailure(chatId: string, reason: string): RouteCooldownState | undefined {
-      if (duration <= 0 || !chatId) return undefined;
-      const prev = entries.get(chatId);
-      const next: RouteCooldownState = {
-        chatId,
-        until: now() + duration,
-        failures: (prev?.failures ?? 0) + 1,
-        reason,
-      };
-      entries.set(chatId, next);
-      return { ...next };
-    },
-    clearCooldown(chatId: string): boolean {
-      return entries.delete(chatId);
-    },
-    clearAllCooldowns(): void {
-      entries.clear();
-    },
+export function extractMigrateToChatId(err: unknown): string | null {
+  if (!err || typeof err !== "object") return null;
+  const record = err as {
+    error_code?: unknown;
+    parameters?: { migrate_to_chat_id?: unknown } | undefined;
   };
+  if (typeof record.error_code === "number" && record.error_code !== 400) {
+    return null;
+  }
+  const raw = record.parameters?.migrate_to_chat_id;
+  if (typeof raw === "number") {
+    return Number.isSafeInteger(raw) && raw !== 0 ? String(raw) : null;
+  }
+  if (typeof raw === "string") {
+    const trimmed = raw.trim();
+    return /^-?\d+$/.test(trimmed) && trimmed !== "0" ? trimmed : null;
+  }
+  return null;
 }
 
 export interface NotifierOptions {
-  /** Override per-route permission-failure cooldown in ms (`0` disables). */
-  cooldownMs?: number | undefined;
-  /** Clock override for cooldown timing (defaults to `Date.now`). */
-  now?: (() => number) | undefined;
-  /** Optional external cooldown tracker shared across callers. */
-  cooldowns?: RouteCooldownTracker | undefined;
+  /** Optional callback invoked when a route is updated via `migrate_to_chat_id`. */
+  onRouteMigrated?: ((fromChatId: string, toChatId: string) => void) | undefined;
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -181,6 +120,59 @@ function eventRefLabel(eventRef: SendExtra["eventRef"]): string {
   return parts.length > 0 ? ` (${parts.join(" ")})` : "";
 }
 
+/** Resolves the destination chat id for a contract source. */
+function resolveChatId(
+  config: Pick<BotConfig, "chatId" | "marketChatId" | "squadChatId"> & Partial<Pick<BotConfig, "chatIds">>,
+  source: ContractSource | undefined,
+): string {
+  const defaultChat = config.chatId ?? config.chatIds?.[0] ?? "";
+  if (source === "market") return config.marketChatId || defaultChat;
+  if (source === "squad") return config.squadChatId || defaultChat;
+  return defaultChat;
+}
+
+/** Resolves whether link previews are disabled for a contract source. */
+function resolveLinkPreviewDisabled(
+  config: Partial<Pick<BotConfig, "linkPreviewMarket" | "linkPreviewSquad">>,
+  source: ContractSource | undefined,
+): boolean {
+  if (source === "market") return !config.linkPreviewMarket;
+  if (source === "squad") return !config.linkPreviewSquad;
+  return true;
+}
+
+// ── routeStatus ──────────────────────────────────────────────────────────────
+
+/** Outcome of checking which configured notification routes are active. */
+export type RouteStatus =
+  | { state: "active"; activeRoutes: number }
+  | {
+      state: "no-active-routes";
+      activeRoutes: 0;
+      /** Human-readable, actionable explanation. Never claims delivery. */
+      message: string;
+    };
+
+/**
+ * Report whether any notification route is active. A zero-active-route result
+ * is reported distinctly from healthy delivery, and it never implies that a
+ * notification was delivered.
+ *
+ * `activeRoutes` is the count of routes the caller considers enabled; when it
+ * is zero the result is `no-active-routes` with an actionable message.
+ */
+export function routeStatus(activeRoutes: number): RouteStatus {
+  if (Number.isFinite(activeRoutes) && activeRoutes > 0) {
+    return { state: "active", activeRoutes: Math.floor(activeRoutes) };
+  }
+  return {
+    state: "no-active-routes",
+    activeRoutes: 0,
+    message:
+      "No notification routes are enabled: every configured route is disabled, so no notifications will be sent. Enable at least one route in the chat configuration (chatId, marketChatId, squadChatId) to receive notifications. No delivery has been attempted or confirmed.",
+  };
+}
+
 // ── notifierSkips ────────────────────────────────────────────────────────────
 
 /**
@@ -189,6 +181,59 @@ function eventRefLabel(eventRef: SendExtra["eventRef"]): string {
  * Telegram API.
  */
 export const notifierSkips = { emptyText: 0, routeCooldown: 0 };
+
+// ── previewRouting ───────────────────────────────────────────────────────────
+
+/** Result of previewing where a notification would be delivered. */
+export interface RoutingPreview {
+  /** Destinations that will receive the message. */
+  matched: Array<{ chatId: string; source: ContractSource | undefined }>;
+  /** Destinations suppressed by policy (empty render, blank chat id). */
+  filtered: Array<{ source: ContractSource | undefined; reason: "empty-text" | "no-chat-id" }>;
+  /** Destinations that cannot be reached (no chat configured for the source). */
+  unavailable: Array<{ source: ContractSource | undefined; reason: "no-chat-id" }>;
+  /** Whether the message would be sent silently. */
+  silent: boolean;
+  /** Link preview disabled flag used for the destination. */
+  linkPreviewDisabled: boolean;
+}
+
+/**
+ * Previews the routing decision for a notification without calling Telegram.
+ * Uses the same chat resolution, empty-text guard, and silent/link-preview
+ * policy as {@link createNotifier}, so the preview cannot drift from delivery.
+ */
+export function previewRouting(
+  text: string | null,
+  config: Pick<BotConfig, "chatId" | "marketChatId" | "squadChatId"> &
+    Partial<Pick<BotConfig, "chatIds" | "linkPreviewMarket" | "linkPreviewSquad" | "silentEvents">>,
+  source?: ContractSource,
+  extra?: Pick<SendExtra, "eventName">,
+): RoutingPreview {
+  const preview: RoutingPreview = {
+    matched: [],
+    filtered: [],
+    unavailable: [],
+    silent: Boolean(
+      extra?.eventName && isSilent(extra.eventName, config.silentEvents ?? DEFAULT_SILENT_EVENTS),
+    ),
+    linkPreviewDisabled: resolveLinkPreviewDisabled(config, source),
+  };
+
+  if (typeof text !== "string" || text.trim() === "") {
+    preview.filtered.push({ source, reason: "empty-text" });
+    return preview;
+  }
+
+  const chatId = resolveChatId(config, source);
+  if (chatId.trim() === "") {
+    preview.unavailable.push({ source, reason: "no-chat-id" });
+    return preview;
+  }
+
+  preview.matched.push({ chatId, source });
+  return preview;
+}
 
 // ── createNotifier ───────────────────────────────────────────────────────────
 
@@ -215,10 +260,8 @@ export type Notifier = ((
   source?: ContractSource,
   extra?: SendExtra,
 ) => Promise<void>) & {
-  clearCooldown: (chatId: string) => boolean;
-  clearAllCooldowns: () => void;
-  isInCooldown: (chatId: string) => boolean;
-  getCooldown: (chatId: string) => RouteCooldownState | undefined;
+  migrateRoute: (fromChatId: string, toChatId: string) => boolean;
+  resolveChatId: (chatId: string) => string;
 };
 
 export function createNotifier(
@@ -227,65 +270,52 @@ export function createNotifier(
     Partial<
       Pick<
         BotConfig,
-        "chatIds" | "linkPreviewMarket" | "linkPreviewSquad" | "silentEvents" | "routeCooldownMs"
+        "chatIds" | "linkPreviewMarket" | "linkPreviewSquad" | "silentEvents" | "routes"
       >
     >,
   options?: NotifierOptions,
 ): Notifier {
-  const now = options?.now ?? Date.now;
-  const cooldownMs = options?.cooldownMs ?? config.routeCooldownMs ?? DEFAULT_ROUTE_COOLDOWN_MS;
-  const cooldowns = options?.cooldowns ?? createRouteCooldownTracker(cooldownMs, now);
+  const migrations = new Map<string, string>();
   const secrets = typeof config.botToken === "string" ? [config.botToken] : [];
 
-  const notify = async (
-    text: string | null,
-    source?: ContractSource,
+  function resolveMigratedChatId(chatId: string): string {
+    let current = chatId;
+    const seen = new Set<string>();
+    while (migrations.has(current) && !seen.has(current)) {
+      seen.add(current);
+      current = migrations.get(current)!;
+    }
+    return current;
+  }
+
+  function migrateRoute(fromChatId: string, toChatId: string): boolean {
+    const from = fromChatId.trim();
+    const to = toChatId.trim();
+    if (!from || !to || from === to) return false;
+    // Prevent cyclic migrations (e.g. to -> ... -> from).
+    if (resolveMigratedChatId(to) === from) return false;
+    if (migrations.get(from) === to) return false;
+
+    migrations.set(from, to);
+    applyChatMigration(config, from, to);
+    console.warn(`[notifier] route migrated to supergroup chat id`);
+    options?.onRouteMigrated?.(from, to);
+    return true;
+  }
+
+  async function sendToChat(
+    chatId: string,
+    text: string,
+    notificationOptions: {
+      parse_mode: "MarkdownV2";
+      link_preview_options: { is_disabled: boolean };
+      disable_notification?: boolean;
+    },
+    silentOption: { disable_notification?: boolean },
     extra?: SendExtra,
-  ): Promise<void> => {
-    if (typeof text !== "string" || text.trim() === "") {
-      notifierSkips.emptyText += 1;
-      // Only bounded metadata: which chat path and how short the render was —
-      // never the payload itself.
-      console.warn(
-        `[notifier] skipped empty message${eventRefLabel(extra?.eventRef)} ` +
-          `(source=${typeof source === "string" && source ? source.slice(0, 32) : "default"}, ` +
-          `chars=${typeof text === "string" ? text.length : -1})`,
-      );
-      return;
-    }
-
-    const defaultChat = config.chatId ?? config.chatIds?.[0] ?? "";
-    const chatId = source === "market"
-      ? config.marketChatId || defaultChat
-      : source === "squad"
-        ? config.squadChatId || defaultChat
-        : defaultChat;
-
-    if (cooldowns.isInCooldown(chatId)) {
-      notifierSkips.routeCooldown += 1;
-      console.warn(
-        `[notifier] skipped send during permission cooldown${eventRefLabel(extra?.eventRef)} ` +
-          `(source=${typeof source === "string" && source ? source.slice(0, 32) : "default"})`,
-      );
-      return;
-    }
-
-    // Select link preview settings based on the contract source.
-    // Commands (where source is undefined) always use TELEGRAM_OPTIONS (disabled).
-    const linkPreviewDisabled = source === "market"
-      ? !config.linkPreviewMarket
-      : source === "squad"
-        ? !config.linkPreviewSquad
-        : true;
-
-    const silentOption = extra?.eventName && isSilent(extra.eventName, config.silentEvents ?? DEFAULT_SILENT_EVENTS)
-      ? { disable_notification: true }
-      : {};
-    const notificationOptions = {
-      parse_mode: "MarkdownV2" as const,
-      link_preview_options: { is_disabled: linkPreviewDisabled },
-      ...silentOption,
-    };
+    omitReplyTo = false,
+  ): Promise<void> {
+    const replyToMessageId = omitReplyTo ? undefined : extra?.replyToMessageId;
 
     try {
       // Oversized payloads go out as ordered chunks under Telegram's limit. The
@@ -315,34 +345,24 @@ export function createNotifier(
           ...(extra?.replyToMessageId !== undefined
             ? { reply_parameters: { chat_id: chatId, message_id: extra.replyToMessageId } }
             : {}),
-        });
-        cooldowns.clearCooldown(chatId);
-        return;
-      } catch (err) {
-        // A blank fallback is no fallback: sending whitespace-only text would
-        // just draw the same 400, so the original parse error propagates.
-        const fallback = extra?.plainText;
-        if (typeof fallback !== "string" || fallback.trim() === "" || !isMarkdownParseError(err)) {
-          throw err;
-        }
-        // Only bounded metadata is logged: the fallback outcome, the safe error
-        // category, and the caller-supplied event reference — never message
-        // text, tokens, or remote payloads.
-        console.warn(
-          `[notifier] MarkdownV2 rejected${eventRefLabel(extra?.eventRef)}, ` +
-            `retrying as plain text: ${safeErrorMessage(err, secrets)}`,
-        );
-        // Plain text (no parse mode), same per-source link preview setting.
-        await bot.api.sendMessage(chatId, fallback, {
-          link_preview_options: notificationOptions.link_preview_options,
-          ...silentOption,
-          ...(extra?.reply_markup ? { reply_markup: extra.reply_markup } : {}),
-          ...(extra?.replyToMessageId !== undefined
-            ? { reply_parameters: { chat_id: chatId, message_id: extra.replyToMessageId } }
+          ...(index === 0 && replyToMessageId !== undefined
+            ? { reply_parameters: { chat_id: chatId, message_id: replyToMessageId } }
             : {}),
         });
         cooldowns.clearCooldown(chatId);
       }
+      return;
+    }
+
+    try {
+      await bot.api.sendMessage(chatId, text, {
+        ...notificationOptions,
+        ...(extra?.reply_markup ? { reply_markup: extra.reply_markup } : {}),
+        ...(replyToMessageId !== undefined
+          ? { reply_parameters: { chat_id: chatId, message_id: replyToMessageId } }
+          : {}),
+      });
+      return;
     } catch (err) {
       if (isPermissionFailure(err)) {
         const reason = safeErrorMessage(err, secrets);
@@ -354,14 +374,68 @@ export function createNotifier(
           );
         }
       }
+      // Only bounded metadata is logged: the fallback outcome, the safe error
+      // category, and the caller-supplied event reference — never message
+      // text, tokens, or remote payloads.
+      console.warn(
+        `[notifier] MarkdownV2 rejected${eventRefLabel(extra?.eventRef)}, ` +
+          `retrying as plain text: ${safeErrorMessage(err, secrets)}`,
+      );
+      // Plain text (no parse mode), same per-source link preview setting.
+      await bot.api.sendMessage(chatId, fallback, {
+        link_preview_options: notificationOptions.link_preview_options,
+        ...silentOption,
+        ...(extra?.reply_markup ? { reply_markup: extra.reply_markup } : {}),
+        ...(replyToMessageId !== undefined
+          ? { reply_parameters: { chat_id: chatId, message_id: replyToMessageId } }
+          : {}),
+      });
+    }
+  }
+
+  const notify = async (
+    text: string | null,
+    source?: ContractSource,
+    extra?: SendExtra,
+  ): Promise<void> => {
+    if (typeof text !== "string" || text.trim() === "") {
+      notifierSkips.emptyText += 1;
+      // Only bounded metadata: which chat path and how short the render was —
+      // never the payload itself.
+      console.warn(
+        `[notifier] skipped empty message${eventRefLabel(extra?.eventRef)} ` +
+          `(source=${typeof source === "string" && source ? source.slice(0, 32) : "default"}, ` +
+          `chars=${typeof text === "string" ? text.length : -1})`,
+      );
+      return;
+    }
+
+    const chatId = resolveChatId(config, source);
+
+    // Select link preview settings based on the contract source.
+    // Commands (where source is undefined) always use TELEGRAM_OPTIONS (disabled).
+    const linkPreviewDisabled = resolveLinkPreviewDisabled(config, source);
+
+    const silentOption = extra?.eventName && isSilent(extra.eventName, config.silentEvents ?? DEFAULT_SILENT_EVENTS)
+      ? { disable_notification: true }
+      : {};
+    const notificationOptions = {
+      parse_mode: "MarkdownV2" as const,
+      link_preview_options: { is_disabled: linkPreviewDisabled },
+      ...silentOption,
+    };
+
+    try {
+      await sendToChat(chatId, text, notificationOptions, silentOption, extra);
+    } catch (err) {
+      const migratedTo = extractMigrateToChatId(err);
+      if (migratedTo && migrateRoute(chatId, migratedTo)) {
+        await sendToChat(migratedTo, text, notificationOptions, silentOption, extra, true);
+        return;
+      }
       throw err;
     }
   };
 
-  return Object.assign(notify, {
-    clearCooldown: (chatId: string) => cooldowns.clearCooldown(chatId),
-    clearAllCooldowns: () => cooldowns.clearAllCooldowns(),
-    isInCooldown: (chatId: string) => cooldowns.isInCooldown(chatId),
-    getCooldown: (chatId: string) => cooldowns.getCooldown(chatId),
-  });
+  return Object.assign(notify, { migrateRoute, resolveChatId: resolveMigratedChatId });
 }
