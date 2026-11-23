@@ -28,6 +28,7 @@ import {
   chatAllowed,
   commandArgumentAllowed,
   commandMetadata,
+  isCommandForAnotherBot,
   isOperator,
   operatorAllowed,
   registeredCommands,
@@ -266,6 +267,7 @@ export function registerCommandHandlers(bot: Bot | CommandRegistrar, deps: BotDe
   const modules = registeredCommands();
   for (const module of modules) {
     registrar.command(module.command, async (ctx) => {
+      if (isCommandForAnotherBot(ctx)) return;
       if (!withinRateLimit(ctx, module.command)) return;
       await dispatch(module, ctx, deps);
     });
@@ -340,13 +342,9 @@ function registerUnknownCommandFallback(
     const raw = text.slice(1, cmdEntity.length);
     const atIndex = raw.indexOf("@");
     const cmdName = atIndex === -1 ? raw : raw.slice(0, atIndex);
-    const mention = atIndex === -1 ? null : raw.slice(atIndex + 1);
 
     // If it targets another bot, ignore.
-    if (mention !== null) {
-      const myUsername = (ctx as unknown as { me?: { username?: string } }).me?.username;
-      if (myUsername && mention.toLowerCase() !== myUsername.toLowerCase()) return;
-    }
+    if (isCommandForAnotherBot(ctx)) return;
 
     // Already handled by a known-command handler — do nothing.
     if (knownCommandNames.includes(cmdName)) return;
@@ -415,9 +413,15 @@ export function createBot(deps: BotDeps): Bot {
 export {
   createNotifier,
   isMarkdownParseError,
+  isForumTopicClosed,
   notifierSkips,
   type SendExtra,
 } from "./notifications/notifier.js";
+export {
+  verifyRoutes,
+  type NotificationRoute,
+  type VerifyRoutesOptions,
+} from "./notifications/verify-routes.js";
 
 /** Registers the command list so Telegram's UI offers autocompletion. */
 export async function registerCommands(bot: Bot, config?: BotConfig): Promise<void> {
